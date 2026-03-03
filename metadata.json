@@ -1,0 +1,5 @@
+{
+  "name": "FastFEED Demo",
+  "description": "A rapid-fire animal feeding game demo based on the FastFEED concept. Swipe to feed animals before time runs out!",
+  "requestFramePermissions": []
+}
