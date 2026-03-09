@@ -598,12 +598,7 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
   return (
     <div 
       ref={gameAreaRef}
-      className="relative w-full h-full overflow-hidden select-none touch-none"
-      style={{
-        backgroundImage: 'url(https://img.freepik.com/free-vector/green-grass-background-texture_1308-43555.jpg)',
-        backgroundSize: 'cover',
-        backgroundPosition: 'center'
-      }}
+      className="relative w-full h-full bg-[#E4E3E0] overflow-hidden select-none touch-none"
     >
       {/* HUD */}
       <div className="absolute top-0 left-0 right-0 p-4 flex justify-between items-start z-50 pointer-events-none">
