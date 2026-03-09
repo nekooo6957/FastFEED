@@ -16,19 +16,39 @@ const random = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)];
 const uid = () => Math.random().toString(36).substr(2, 9);
 
 // Grid Configuration
-const GRID_ROWS = [40, 60, 80]; // Bottom % (Further away)
-const GRID_COLS = [20, 50, 80]; // Left % (Wider)
+// Dynamic generation based on level
 
 interface GameScreenProps {
   onGameOver: (score: number, reason?: string) => void;
   onWin: (score: number) => void;
 }
 
+// Helper for hitbox scaling
+// Level 1-3: 1.3 * globalScale (Standard)
+// Level 4: 1.25 * globalScale (Further increased)
+// Level 5+: 1.08 * globalScale (Increased proportionally to L4)
+const getHitScaleByY = (yPct: number, globalScale: number = 1, level: number = 1) => {
+  if (level === 4) {
+    return 1.25 * globalScale;
+  }
+  if (level >= 5) {
+    return 1.08 * globalScale;
+  }
+  return 1.3 * globalScale;
+};
+
 export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
   // --- Game State ---
   const [level, setLevel] = useState(1);
+  
+  // Calculate Global Scale based on Level to prevent overlap
+  // Level 1: 1.0
+  // Level 2: 0.95
+  // Level 3: 0.9
+  // Level 4: 0.85
+  // Level 5: 0.8
+  const globalScale = Math.max(0.8, 1 - (level - 1) * 0.05);
   const [score, setScore] = useState(0);
-  const [timeLeft, setTimeLeft] = useState(LEVEL_CONFIG[0].time);
   const [animals, setAnimals] = useState<AnimalEntity[]>([]);
   const [currentFood, setCurrentFood] = useState<FoodType>('bone');
   const [nextFoods, setNextFoods] = useState<FoodType[]>([]);
@@ -51,7 +71,7 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
   const chargeCircleRef = useRef<SVGCircleElement>(null);
 
   const gameAreaRef = useRef<HTMLDivElement>(null);
-  const [flyingFood, setFlyingFood] = useState<{
+  const [flyingFoods, setFlyingFoods] = useState<{
     id: string;
     type: FoodType;
     startX: number;
@@ -60,84 +80,189 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
     targetY: number;
     duration: number;
     charge: number; // For rotation speed
-  } | null>(null);
+  }[]>([]);
+  
+  // Refs for collision detection to avoid stale closures
+  const animalsRef = useRef(animals);
+  const processedFoodIds = useRef<Set<string>>(new Set());
+  
+  // Track Game Area Dimensions in State for Responsive Rendering
+  const [gameDimensions, setGameDimensions] = useState({ 
+    width: typeof window !== 'undefined' ? window.innerWidth : 1000, 
+    height: typeof window !== 'undefined' ? window.innerHeight : 1000 
+  });
+
+  useEffect(() => {
+    animalsRef.current = animals;
+  }, [animals]);
+
+  // Track Game Area Dimensions
+  useEffect(() => {
+    if (!gameAreaRef.current) return;
+    
+    const observer = new ResizeObserver(entries => {
+      for (const entry of entries) {
+        setGameDimensions({
+          width: entry.contentRect.width,
+          height: entry.contentRect.height
+        });
+      }
+    });
+    
+    observer.observe(gameAreaRef.current);
+    return () => observer.disconnect();
+  }, []);
+
+  const [discardedFood, setDiscardedFood] = useState<{ type: FoodType, id: number } | null>(null);
 
   // --- Initialization ---
   useEffect(() => {
     startLevel(1);
   }, []);
 
-  // --- Charge Animation Loop ---
-  useEffect(() => {
-    if (isCharging) {
-      const duration = 2000; // 2 seconds for full cycle
-      
-      const loop = () => {
-        const now = performance.now();
-        const elapsed = now - chargeStartTimeRef.current;
-        
-        // Linear ramp 0 to 100, then wrap around
-        const t = (elapsed % duration) / duration; 
-        const val = t * 100;
-        
-        chargeValueRef.current = val;
-        
-        if (chargeBarRef.current) {
-          chargeBarRef.current.style.width = `${val}%`;
-        }
-        if (chargeCircleRef.current) {
-          const offset = 283 - (283 * val) / 100;
-          chargeCircleRef.current.style.strokeDashoffset = `${offset}`;
-        }
-        
-        chargeRafRef.current = requestAnimationFrame(loop);
-      };
-      
-      chargeRafRef.current = requestAnimationFrame(loop);
-    } else {
-      cancelAnimationFrame(chargeRafRef.current);
-    }
+  // --- Hit Detection & Scaling Constants ---
+  // Use fixed percentage radius to ensure consistent gaps across screen sizes
+  // 10.5% radius = 21% diameter
+  // Level 4 Spacing is 20%. 
+  // Level 4 Scale is 0.85 * 0.95 = 0.8075
+  // Effective Diameter = 21% * 0.8075 = 16.95%
+  // Gap = 20% - 16.95% = 3.05% (Consistent on all screens)
+  const baseHitRadiusPct = 10.5;
+  const foodHitRadiusPct = 2.5; // Food radius for circle-circle collision
+
+  // Calculate Visual Scale Multiplier
+  // We want the visual emoji (text-6xl ~ 60px) to match the hitbox size
+  // Hitbox Diameter (px) = width * (baseHitRadiusPct / 100) * 2
+  // Visual Size (px) = 60 * Scale
+  // So Scale Factor = Hitbox Diameter / 60
+  const visualScaleMultiplier = (gameDimensions.width * (baseHitRadiusPct / 100) * 2) / 60;
+
+  const getVisualScale = (yPct: number) => {
+    // Get the hitbox scale (relative factor)
+    const hitScale = getHitScaleByY(yPct, globalScale, level);
+    // Apply the correction multiplier so visual matches hitbox
+    return hitScale * visualScaleMultiplier;
+  };
+
+  // --- Discard Logic ---
+  const handleDiscard = () => {
+    if (nextFoods.length === 0) return;
+
+    // Trigger animation
+    setDiscardedFood({ type: currentFood, id: Date.now() });
     
-    return () => cancelAnimationFrame(chargeRafRef.current);
-  }, [isCharging]);
+    // Clear animation after it plays
+    setTimeout(() => setDiscardedFood(null), 500);
+
+    // Logic to get next food
+    const hungryTypes = new Set(animals.filter(a => a.state === 'hungry').map(a => a.type));
+    let currentLevelAllowedFoods = getLevelAllowedFoods(level);
+    
+    if (hungryTypes.size > 0) {
+      // Explicitly cast t to AnimalType to avoid TS error
+      currentLevelAllowedFoods = Array.from(hungryTypes).map(t => ANIMALS[t as import('../types').AnimalType].preferredFood);
+    }
+
+    const next = nextFoods[0];
+    const newFoodItem = random(currentLevelAllowedFoods) || 'bone';
+    const newQueue = [...nextFoods.slice(1), newFoodItem];
+    
+    setCurrentFood(next);
+    setNextFoods(newQueue);
+  };
+
+  // --- Charge Animation Loop Removed (Now Distance Based) ---
+  // useEffect(() => { ... }, [isCharging]);
 
   const getLevelAllowedFoods = (lvl: number) => {
-    const config = LEVEL_CONFIG.find(c => c.level === lvl) || LEVEL_CONFIG[0];
-    const allowedFoods = config.types.map(t => ANIMALS[t].preferredFood);
-    return Array.from(new Set(allowedFoods));
+    // Use config if available, otherwise allow all foods
+    const config = LEVEL_CONFIG.find(c => c.level === lvl);
+    if (config) {
+      const allowedFoods = config.types.map(t => ANIMALS[t].preferredFood);
+      return Array.from(new Set(allowedFoods));
+    }
+    // Default for higher levels: all foods
+    return Object.values(ANIMALS).map(a => a.preferredFood);
   };
 
   const startLevel = (lvl: number) => {
-    const config = LEVEL_CONFIG.find(c => c.level === lvl) || LEVEL_CONFIG[0];
     setLevel(lvl);
-    setTimeLeft(config.time);
     setCombo(0);
     setShieldActive(false);
     setPowerUpsUsed({ shield: false, magnet: false });
     
-    // Generate Grid Slots (0-8)
-    const slots = Array.from({ length: 9 }, (_, i) => i);
+    const gridSize = lvl; // 1x1, 2x2, 3x3, etc.
+    const animalCount = gridSize * gridSize;
+    
+    // Calculate Grid Positions
+    const minRow = 40, maxRow = 80;
+    
+    // Dynamic column range based on level to prevent overcrowding
+    let minCol = 20;
+    let maxCol = 80;
+    
+    if (lvl === 4) {
+      minCol = 15;
+      maxCol = 85;
+    } else if (lvl >= 5) {
+      minCol = 10;
+      maxCol = 90;
+    }
+    
+    const getRowPos = (i: number) => {
+      if (gridSize === 1) return (minRow + maxRow) / 2;
+      return minRow + (i * (maxRow - minRow)) / (gridSize - 1);
+    };
+    
+    const getColPos = (j: number) => {
+      if (gridSize === 1) return 50; // Center
+      return minCol + (j * (maxCol - minCol)) / (gridSize - 1);
+    };
+
+    // Generate Grid Slots
+    const slots = Array.from({ length: animalCount }, (_, i) => i);
     // Shuffle slots
     for (let i = slots.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1));
       [slots[i], slots[j]] = [slots[j], slots[i]];
     }
 
+    // Determine allowed animal types
+    let allowedTypes = Object.keys(ANIMALS) as import('../types').AnimalType[];
+    const config = LEVEL_CONFIG.find(c => c.level === lvl);
+    if (config) {
+      allowedTypes = config.types;
+    }
+
     // Spawn animals in slots
     const newAnimals: AnimalEntity[] = [];
-    for (let i = 0; i < config.animalCount; i++) {
-      const type = random(config.types);
+    for (let i = 0; i < animalCount; i++) {
+      const type = random(allowedTypes);
       const slotIndex = slots[i];
-      const row = Math.floor(slotIndex / 3);
-      const col = slotIndex % 3;
+      const row = Math.floor(slotIndex / gridSize);
+      const col = slotIndex % gridSize;
       
+      let requiredFeeds = 1;
+      if (lvl === 2) {
+        // Level 2: Some 1, some 2 (50/50 chance)
+        requiredFeeds = Math.random() > 0.5 ? 2 : 1;
+      } else if (lvl >= 3) {
+        // Level 3+: 1, 2, 3 (Weighted towards 2 and 3)
+        const r = Math.random();
+        if (r < 0.2) requiredFeeds = 1;
+        else if (r < 0.6) requiredFeeds = 2;
+        else requiredFeeds = 3;
+      }
+
       newAnimals.push({
         id: uid(),
         type,
-        x: GRID_COLS[col],
-        y: GRID_ROWS[row],
+        x: getColPos(col),
+        y: getRowPos(row),
         state: 'hungry',
-        hungerTimer: 0
+        hungerTimer: 0,
+        requiredFeeds,
+        currentFeeds: 0
       });
     }
     setAnimals(newAnimals);
@@ -150,30 +275,9 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
     setNextFoods(initialFoods.slice(1));
   };
 
-  // --- Timer ---
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setTimeLeft(prev => {
-        if (prev <= 0) {
-          clearInterval(timer);
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
-    return () => clearInterval(timer);
-  }, []);
-
-  // Check for Time's Up
-  useEffect(() => {
-    if (timeLeft === 0) {
-      onGameOver(score, "Time's Up!");
-    }
-  }, [timeLeft, onGameOver, score]);
-
   // --- Interaction Logic ---
   const handlePointerDown = (e: PointerEvent) => {
-    if (flyingFood) return;
+    // Removed single food check to allow rapid fire
     
     const target = e.currentTarget as HTMLElement;
     target.setPointerCapture(e.pointerId);
@@ -207,9 +311,25 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
     const currentY = e.clientY - gameRect.top;
     
     const dx = currentX - startPosRef.current.x;
-    const dy = currentY - startPosRef.current.y;
+    const dy = Math.max(0, currentY - startPosRef.current.y); // Restrict upward dragging
     
     setDragOffset({ x: dx, y: dy });
+
+    // Cartesian Charging (Linear Vertical Force)
+    // Power is primarily determined by how far down you pull
+    const maxDrag = 150; 
+    const charge = Math.min((dy / maxDrag) * 100, 100);
+    
+    chargeValueRef.current = charge;
+
+    // Update Visuals directly
+    if (chargeBarRef.current) {
+      chargeBarRef.current.style.width = `${charge}%`;
+    }
+    if (chargeCircleRef.current) {
+      const offset = 283 - (283 * charge) / 100;
+      chargeCircleRef.current.style.strokeDashoffset = `${offset}`;
+    }
   };
 
   const handlePointerUp = (e: PointerEvent) => {
@@ -219,42 +339,39 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
     cancelAnimationFrame(chargeRafRef.current);
     setIsCharging(false);
     
-    // Determine Throw Vector
-    let angle = -Math.PI / 2; 
-    
-    if (Math.abs(dragOffset.x) > 10 || Math.abs(dragOffset.y) > 10) {
-      angle = Math.atan2(dragOffset.y, dragOffset.x);
-    }
-
-    // Distance based on Charge (Calibrated for 5 segments)
-    // Max distance in pixels (e.g., 80% of screen height)
     const gameRect = gameAreaRef.current.getBoundingClientRect();
-    const maxDistPx = gameRect.height * 0.8;
     
-    // Charge 0-100 -> Distance 0-maxDistPx
-    const chargeVal = chargeValueRef.current;
-    const distPercent = chargeVal / 100;
-    const throwDistPx = maxDistPx * distPercent;
+    // Calculate Start Position (Hand Position)
+    const spawnPxX = startPosRef.current.x + dragOffset.x;
+    const spawnPxY = startPosRef.current.y + dragOffset.y;
+
+    // Cartesian Launch Logic
+    // We apply a multiplier to the drag vector to get the throw vector
+    // This ensures "Linear" feel: Pulling down X pixels always adds Y pixels of distance
+    const FORCE_MULTIPLIER = 5.0; // Amplification factor (Drag 1px -> Throw 5px)
     
-    // Calculate Target in Pixels
-    // Start Pos is already in pixels relative to game area
-    const targetPxX = startPosRef.current.x + Math.cos(angle) * throwDistPx;
-    const targetPxY = startPosRef.current.y + Math.sin(angle) * throwDistPx;
+    // Drag Down (+y) -> Throw Up (-y)
+    const throwVecX = -dragOffset.x * FORCE_MULTIPLIER;
+    const throwVecY = -dragOffset.y * FORCE_MULTIPLIER;
+
+    // Calculate Target
+    const targetPxX = spawnPxX + throwVecX;
+    const targetPxY = spawnPxY + throwVecY;
+    
+    // Charge for animation speed (based on vertical pull)
+    // Use same maxDrag as in handlePointerMove
+    const chargeVal = Math.min((dragOffset.y / 150) * 100, 100);
     
     // Convert to Percentages for rendering
-    // Note: Our CSS uses 'left' and 'bottom'. 
-    // startPosRef.current.y is from TOP.
-    // So bottom% = (height - y) / height * 100
-    
-    const startXPct = (startPosRef.current.x / gameRect.width) * 100;
-    const startYPct = ((gameRect.height - startPosRef.current.y) / gameRect.height) * 100;
+    const startXPct = (spawnPxX / gameRect.width) * 100;
+    const startYPct = ((gameRect.height - spawnPxY) / gameRect.height) * 100;
     
     const targetXPct = (targetPxX / gameRect.width) * 100;
     const targetYPct = ((gameRect.height - targetPxY) / gameRect.height) * 100;
 
     // Launch
     const foodToThrow = currentFood;
-    setFlyingFood({
+    const newFood = {
       id: uid(),
       type: foodToThrow,
       startX: startXPct,
@@ -263,12 +380,22 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
       targetY: targetYPct,
       duration: 0.8,
       charge: chargeVal
-    });
+    };
+
+    setFlyingFoods(prev => [...prev, newFood]);
 
     // Cycle Food
-    const allowedFoods = getLevelAllowedFoods(level);
+    // Filter allowed foods to only those needed by current hungry animals
+    const hungryTypes = new Set(animals.filter(a => a.state === 'hungry').map(a => a.type));
+    let currentLevelAllowedFoods = getLevelAllowedFoods(level);
+    
+    if (hungryTypes.size > 0) {
+      // Explicitly cast t to AnimalType to avoid TS error
+      currentLevelAllowedFoods = Array.from(hungryTypes).map(t => ANIMALS[t as import('../types').AnimalType].preferredFood);
+    }
+
     const next = nextFoods[0];
-    const newQueue = [...nextFoods.slice(1), random(allowedFoods)];
+    const newQueue = [...nextFoods.slice(1), random(currentLevelAllowedFoods)];
     setCurrentFood(next);
     setNextFoods(newQueue);
     
@@ -279,30 +406,47 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
   };
 
   // --- Hit Detection ---
+  // (Constants moved to top of component)
+
+
   useEffect(() => {
-    if (!flyingFood) return;
-
-    const timer = setTimeout(() => {
-      checkCollision(flyingFood);
-      setFlyingFood(null);
-    }, flyingFood.duration * 1000);
-
-    return () => clearTimeout(timer);
-  }, [flyingFood]);
+    flyingFoods.forEach(food => {
+      if (processedFoodIds.current.has(food.id)) return;
+      
+      processedFoodIds.current.add(food.id);
+      
+      setTimeout(() => {
+        checkCollision(food);
+        setFlyingFoods(prev => prev.filter(f => f.id !== food.id));
+        processedFoodIds.current.delete(food.id);
+      }, food.duration * 1000);
+    });
+  }, [flyingFoods]);
 
   const checkCollision = (food: {type: FoodType, targetX: number, targetY: number}) => {
     let closestAnimal: AnimalEntity | null = null;
     let minDist = 10000;
-    const HIT_RADIUS = 15;
+    
+    const { width, height } = gameDimensions;
+    const aspectRatio = height / width;
 
-    animals.forEach(animal => {
+    // Use ref to get latest animals state inside timeout
+    animalsRef.current.forEach(animal => {
       if (animal.state === 'dead' || animal.state === 'full') return;
 
+      // Use hit scale for collision detection (more forgiving at distance)
+      const scale = getHitScaleByY(animal.y, globalScale, level);
+      const effectiveHitRadius = baseHitRadiusPct * scale;
+      const effectiveFoodRadius = foodHitRadiusPct * scale;
+
       const dx = animal.x - food.targetX;
-      const dy = animal.y - food.targetY;
+      // Correct DY by aspect ratio to ensure circular hit zone in pixels
+      let dy = (animal.y - food.targetY) * aspectRatio;
+      
+      // Circle-Circle Collision
       const dist = Math.sqrt(dx*dx + dy*dy);
 
-      if (dist < HIT_RADIUS) { 
+      if (dist < (effectiveHitRadius + effectiveFoodRadius)) { 
         if (dist < minDist) {
           minDist = dist;
           closestAnimal = animal;
@@ -325,9 +469,18 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
         // It was in the playable zone but missed
         // Check if it was close to any animal
         let closeToAny = false;
-        animals.forEach(a => {
-           const dist = Math.sqrt(Math.pow(a.x - food.targetX, 2) + Math.pow(a.y - food.targetY, 2));
-           if (dist < HIT_RADIUS * 1.5) closeToAny = true;
+        animalsRef.current.forEach(a => {
+           const scale = getHitScaleByY(a.y, globalScale, level);
+           const effectiveHitRadius = baseHitRadiusPct * scale;
+           const effectiveFoodRadius = foodHitRadiusPct * scale;
+           
+           const dx = a.x - food.targetX;
+           let dy = (a.y - food.targetY) * aspectRatio;
+           // No asymmetric logic here either
+           
+           const dist = Math.sqrt(dx*dx + dy*dy);
+           
+           if (dist < (effectiveHitRadius + effectiveFoodRadius) * 1.5) closeToAny = true;
         });
         
         if (closeToAny) {
@@ -354,19 +507,30 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
     const config = ANIMALS[animal.type];
     
     if (foodType === config.preferredFood) {
-      updateAnimalState(animal.id, 'full');
-      setCombo(c => c + 1);
-      setScore(s => s + 100 + (combo * 10)); 
-      showFeedback(`命中! x${combo + 1}`, animal.x, animal.y);
+      const newCurrentFeeds = (animal.currentFeeds || 0) + 1;
+      const isFull = newCurrentFeeds >= (animal.requiredFeeds || 1);
+
+      if (isFull) {
+        updateAnimalState(animal.id, 'full');
+        setCombo(c => c + 1);
+        setScore(s => s + 100 + (combo * 10)); 
+        showFeedback(`命中! x${combo + 1}`, animal.x, animal.y);
+      } else {
+        // Partial Feed
+        setAnimals(prev => prev.map(a => a.id === animal.id ? { ...a, currentFeeds: newCurrentFeeds } : a));
+        setCombo(c => c + 1);
+        setScore(s => s + 50);
+        showFeedback(`再喂${(animal.requiredFeeds || 1) - newCurrentFeeds}次!`, animal.x, animal.y);
+      }
       
+      // Check Level Completion
+      // We need to count how many are NOT full (excluding this one if it just became full)
       const remaining = animals.filter(a => a.id !== animal.id && a.state === 'hungry').length;
-      if (remaining === 0) {
+      
+      // If this was the last hungry one and it is now full
+      if (remaining === 0 && isFull) {
         setTimeout(() => {
-          if (level < 3) {
-            startLevel(level + 1);
-          } else {
-            onWin(score + 100);
-          }
+          startLevel(level + 1);
         }, 1000);
       }
     } else {
@@ -387,7 +551,7 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
 
   const showFeedback = (text: string, x: number, y: number) => {
     setFeedback({ id: uid(), text, x, y });
-    setTimeout(() => setFeedback(null), 1000);
+    setTimeout(() => setFeedback(null), 2000);
   };
 
   // --- Power Ups ---
@@ -409,20 +573,18 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
     
     const target = hungryAnimals[0];
     if (target) {
-      // Move to Front Center (Row 0, Col 1)
-      setAnimals(prev => prev.map(a => a.id === target.id ? { ...a, y: GRID_ROWS[0], x: GRID_COLS[1] } : a));
+      // Move to Front Center (Row 0, Col 1 equivalent)
+      setAnimals(prev => prev.map(a => a.id === target.id ? { ...a, y: 40, x: 50 } : a));
       setPowerUpsUsed(p => ({ ...p, magnet: true }));
       showFeedback("Come Here!", 50, 50);
     }
   };
 
   // --- Render Helpers ---
+  // getScaleByY moved outside
+
   const getAnimalStyle = (animal: AnimalEntity) => {
-    // Scale based on Row (Y)
-    // Front (25%) -> Scale 1.0
-    // Mid (50%) -> Scale 0.85
-    // Back (75%) -> Scale 0.7
-    const scale = 1 - ((animal.y - 25) / 50) * 0.3; 
+    const scale = getVisualScale(animal.y);
     const zIndex = 100 - Math.floor(animal.y);
     
     return {
@@ -436,24 +598,17 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
   return (
     <div 
       ref={gameAreaRef}
-      className="relative w-full h-full bg-[#E4E3E0] overflow-hidden select-none touch-none"
-      onPointerUp={handlePointerUp}
-      onPointerLeave={handlePointerUp}
+      className="relative w-full h-full overflow-hidden select-none touch-none"
+      style={{
+        backgroundImage: 'url(https://img.freepik.com/free-vector/green-grass-background-texture_1308-43555.jpg)',
+        backgroundSize: 'cover',
+        backgroundPosition: 'center'
+      }}
     >
       {/* HUD */}
       <div className="absolute top-0 left-0 right-0 p-4 flex justify-between items-start z-50 pointer-events-none">
         <div className="bg-white/80 backdrop-blur rounded-xl px-4 py-2 border-2 border-black font-mono font-bold">
           LEVEL {level}
-        </div>
-        <div className="flex flex-col items-center">
-          <div className="text-4xl font-black text-black tracking-tighter">{timeLeft}s</div>
-          <div className="w-32 h-2 bg-gray-300 rounded-full mt-1 overflow-hidden border border-black">
-            <motion.div 
-              className="h-full bg-green-500"
-              initial={{ width: '100%' }}
-              animate={{ width: `${(timeLeft / (LEVEL_CONFIG.find(c=>c.level===level)?.time || 30)) * 100}%` }}
-            />
-          </div>
         </div>
         <div className="bg-black text-white rounded-xl px-4 py-2 font-mono font-bold">
           {score} PTS
@@ -462,6 +617,7 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
 
       {/* Animals */}
       {animals.map(animal => {
+        if (animal.state === 'full') return null;
         const config = ANIMALS[animal.type];
         return (
           <div
@@ -470,9 +626,16 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
             style={getAnimalStyle(animal)}
           >
             <div className="relative flex flex-col items-center">
-              {/* Status Bubble */}
+              {/* Feed Count Indicator - Moved Closer */}
+              {animal.state === 'hungry' && animal.requiredFeeds > 1 && (
+                <div className="absolute -top-4 -right-4 bg-black text-white rounded-full w-6 h-6 flex items-center justify-center text-sm font-bold border-2 border-white z-20">
+                  {animal.requiredFeeds - animal.currentFeeds}
+                </div>
+              )}
+
+              {/* Status Bubble - Moved Closer */}
               {animal.state === 'hungry' && (
-                <div className="absolute -top-12 bg-white border-2 border-black rounded-full px-2 py-1 animate-bounce whitespace-nowrap">
+                <div className="absolute -top-8 bg-white border-2 border-black rounded-full px-2 py-1 animate-bounce whitespace-nowrap z-10">
                   {FOODS[config.preferredFood].emoji}
                 </div>
               )}
@@ -492,35 +655,89 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
         );
       })}
 
+      {/* Debug Hit Zones */}
+      {animals.map(animal => {
+        if (animal.state === 'full') return null;
+        const scale = getHitScaleByY(animal.y, globalScale, level);
+        const effectiveHitRadius = baseHitRadiusPct * scale;
+        
+        return (
+          <div
+            key={`hit-${animal.id}`}
+            className="absolute border-2 border-red-500/50 bg-red-500/10 rounded-full pointer-events-none z-[150]"
+            style={{
+              left: `${animal.x}%`,
+              bottom: `${animal.y}%`,
+              width: `${effectiveHitRadius * 2}%`,
+              aspectRatio: '1/1',
+              transform: 'translate(-50%, 50%)'
+            }}
+          />
+        );
+      })}
+
       {/* Flying Food (3D Parabola) */}
       <AnimatePresence>
-        {flyingFood && (
-          <motion.div
-            key={flyingFood.id}
-            initial={{ 
-              left: `${flyingFood.startX}%`, 
-              bottom: `${flyingFood.startY}%`, 
-              scale: 1,
-              rotate: 0
-            }}
-            animate={{ 
-              left: `${flyingFood.targetX}%`, 
-              bottom: `${flyingFood.targetY}%`, 
-              // Scale: Start Small(1) -> Apex Big(1.5) -> Land Small(0.6)
-              scale: [1, 1.8, 0.6], 
-              rotate: 360 * (1 + flyingFood.charge / 20)
-            }}
-            transition={{ 
-              duration: flyingFood.duration, 
-              ease: "easeInOut", // Smooth arc
-              times: [0, 0.5, 1] // Apex at 50%
-            }}
-            className="absolute w-12 h-12 flex items-center justify-center text-4xl z-[200]"
-            style={{ transform: 'translate(-50%, 50%)' }}
-          >
-            {FOODS[flyingFood.type].emoji}
-          </motion.div>
-        )}
+        {flyingFoods.map(food => {
+          // Calculate scales for this specific food
+          const startScale = getVisualScale(food.startY);
+          const targetScale = getVisualScale(food.targetY);
+          
+          return (
+            <div key={food.id} className="absolute inset-0 pointer-events-none z-[200]">
+               {/* Shadow (Ground Path) - Moves Linearly */}
+               <motion.div
+                initial={{ 
+                  left: `${food.startX}%`, 
+                  bottom: `${food.startY}%`,
+                  scale: startScale,
+                  opacity: 0.5
+                }}
+                animate={{ 
+                  left: `${food.targetX}%`, 
+                  bottom: `${food.targetY}%`,
+                  scale: targetScale,
+                  opacity: 0.2
+                }}
+                transition={{ 
+                  duration: food.duration, 
+                  ease: "linear" 
+                }}
+                className="absolute w-12 h-4 bg-black rounded-full blur-sm"
+                style={{ transform: 'translate(-50%, 50%)' }}
+              />
+
+              {/* Food Sprite (Arc) - Moves Linearly X/Y, Parabolic Z (translateY) */}
+              <motion.div
+                initial={{ 
+                  left: `${food.startX}%`, 
+                  bottom: `${food.startY}%`, 
+                  scale: startScale,
+                  rotate: 0,
+                  y: 0 
+                }}
+                animate={{ 
+                  left: `${food.targetX}%`, 
+                  bottom: `${food.targetY}%`, 
+                  scale: targetScale,
+                  rotate: 360 * (1 + food.charge / 20),
+                  y: [0, -150, 0] // The Arc (Height)
+                }}
+                transition={{ 
+                  left: { duration: food.duration, ease: "linear" },
+                  bottom: { duration: food.duration, ease: "linear" },
+                  scale: { duration: food.duration, ease: "linear" },
+                  rotate: { duration: food.duration, ease: "linear" },
+                  y: { duration: food.duration, ease: "easeInOut", times: [0, 0.5, 1] }
+                }}
+                className="absolute w-12 h-12 flex items-center justify-center text-4xl"
+                style={{ transformOrigin: 'center center', transform: 'translate(-50%, 50%)' }}
+              >
+                {FOODS[food.type].emoji}
+              </motion.div>
+            </div>
+          );
+        })}
       </AnimatePresence>
 
       {/* Feedback Text */}
@@ -528,9 +745,10 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
         {feedback && (
           <motion.div
             initial={{ opacity: 1, y: 0, scale: 0.5 }}
-            animate={{ opacity: 0, y: -50, scale: 1.5 }}
+            animate={{ opacity: 0, y: -30, scale: 1.2 }}
             exit={{ opacity: 0 }}
-            className="absolute z-[300] font-black text-3xl text-stroke-white text-black pointer-events-none whitespace-nowrap"
+            transition={{ duration: 1 }}
+            className="absolute z-[300] font-black text-xl text-stroke-white text-black pointer-events-none whitespace-nowrap"
             style={{ left: `${feedback.x}%`, bottom: `${feedback.y}%`, transform: 'translate(-50%, 0)' }}
           >
             {feedback.text}
@@ -538,93 +756,180 @@ export function GameScreen({ onGameOver, onWin }: GameScreenProps) {
         )}
       </AnimatePresence>
 
-      {/* Power-ups */}
-      <div className="absolute bottom-36 left-0 right-0 px-4 flex justify-between pointer-events-auto z-[150]">
-        <button 
-          className={`p-3 rounded-full shadow-lg border-2 border-black active:scale-95 transition-transform flex items-center gap-2 ${
-            powerUpsUsed.shield ? 'bg-gray-400 opacity-50 cursor-not-allowed' : 
-            shieldActive ? 'bg-green-500 text-white ring-4 ring-green-300' : 'bg-blue-500 text-white'
-          }`}
-          onClick={activateShield}
-          disabled={powerUpsUsed.shield}
-        >
-          <span className="text-xl">🛡️</span>
-          <span className="text-xs font-bold">{shieldActive ? 'ACTIVE' : '无敌'}</span>
-        </button>
-        
-        <button 
-          className={`bg-red-500 text-white p-3 rounded-full shadow-lg border-2 border-black active:scale-95 transition-transform flex items-center gap-2 ${
-            powerUpsUsed.magnet ? 'bg-gray-400 opacity-50 cursor-not-allowed' : ''
-          }`}
-          onClick={activateMagnet}
-          disabled={powerUpsUsed.magnet}
-        >
-          <span className="text-xl">🧲</span>
-          <span className="text-xs font-bold">快过来</span>
-        </button>
-      </div>
-
       {/* Player Launcher (Bottom) */}
-      <div className="absolute bottom-0 left-0 right-0 h-48 bg-gradient-to-t from-black/10 to-transparent flex flex-col items-center justify-end pb-16 z-[100] pointer-events-auto">
+      <div className="absolute bottom-0 left-0 right-0 h-64 bg-gradient-to-t from-black/10 to-transparent flex flex-col items-center justify-end pb-12 z-[100] pointer-events-auto">
         
-        {/* Current Food (Draggable Visual) */}
-        <div 
-          className="relative"
-          onPointerDown={handlePointerDown}
-          onPointerMove={handlePointerMove}
-        >
-          {/* Guide Arrow / Charge Indicator */}
-          {isCharging && (
-            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-4 flex flex-col items-center">
-              {/* Charge Bar */}
-              <div className="w-16 h-2 bg-gray-300 rounded-full overflow-hidden border border-black mb-2 relative">
-                {/* Segment Markers */}
-                <div className="absolute left-[20%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
-                <div className="absolute left-[40%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
-                <div className="absolute left-[60%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
-                <div className="absolute left-[80%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
-                
-                <div 
-                  ref={chargeBarRef}
-                  className="h-full bg-orange-500"
-                  style={{ width: '0%', transition: 'none' }}
-                />
+        <div className="relative w-full flex items-end justify-center">
+          
+          {/* Left Group - Pinned to Left Edge */}
+          <div className="absolute left-5 bottom-0 flex flex-col items-center gap-2">
+            <div className="relative h-32 w-24">
+              {/* Shield (Top) */}
+              <div className="absolute top-0 left-0 right-0 flex flex-col items-center">
+                <button 
+                  className={`w-24 h-12 rounded-full shadow-lg border-2 border-black active:scale-95 transition-transform flex items-center justify-center gap-1 ${
+                    powerUpsUsed.shield ? 'bg-gray-400 opacity-50 cursor-not-allowed' : 
+                    shieldActive ? 'bg-green-100 text-black ring-4 ring-green-300' : 'bg-white text-black'
+                  }`}
+                  onClick={activateShield}
+                  disabled={powerUpsUsed.shield}
+                  title="Shield"
+                >
+                  <span className="text-xl">🛡️</span>
+                </button>
+              </div>
+              {/* Shield Label */}
+              <div className="absolute top-14 left-0 right-0 flex justify-center">
+                <span className="text-[10px] font-bold text-white drop-shadow-md">护盾</span>
+              </div>
+              
+              {/* Next Food (Bottom) - Now a Pill Button */}
+              <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center">
+                <div className={`w-24 h-12 rounded-full border-2 border-black flex items-center justify-center shadow-lg bg-white`}>
+                  {nextFoods.length > 0 && (
+                    <span className="text-3xl">{FOODS[nextFoods[0]].emoji}</span>
+                  )}
+                </div>
               </div>
             </div>
-          )}
+            {/* Next Food Label - Outside */}
+            <span className="text-[10px] font-bold text-white drop-shadow-md mt-1">即将上菜</span>
+          </div>
 
-          <motion.div 
-            className={`w-20 h-20 rounded-full border-4 border-black flex items-center justify-center text-4xl shadow-xl cursor-grab active:cursor-grabbing ${FOODS[currentFood].color} ${isCharging ? 'scale-110' : ''}`}
-            animate={{
-              scale: isCharging ? [1, 1.1, 1] : 1,
-            }}
-            transition={{ repeat: isCharging ? Infinity : 0, duration: 0.5 }}
-          >
-            {/* Charge Ring Overlay */}
-            <svg className="absolute inset-0 w-full h-full -rotate-90 pointer-events-none">
-              <circle
-                ref={chargeCircleRef}
-                cx="50%" cy="50%" r="45%"
-                fill="none"
-                stroke="black"
-                strokeWidth="4"
-                strokeDasharray="283" // 2 * PI * r (approx 45% of 80px width? No, r is relative)
-                strokeDashoffset={283}
-                opacity={isCharging ? 1 : 0}
-                style={{ transition: 'none' }}
-              />
-            </svg>
-            {FOODS[currentFood].emoji}
-          </motion.div>
-        </div>
+          {/* Current Food (Center) */}
+          <div className="flex flex-col items-center gap-2">
+            <div 
+              className="relative z-10"
+              onPointerDown={handlePointerDown}
+              onPointerMove={handlePointerMove}
+              onPointerUp={handlePointerUp}
+            >
+              {/* Guide Arrow / Charge Indicator */}
+              {isCharging && (
+                <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-4 flex flex-col items-center">
+                  {/* Charge Bar */}
+                  <div className="w-24 h-3 bg-gray-300 rounded-full overflow-hidden border border-black mb-2 relative">
+                    {/* Segment Markers */}
+                    <div className="absolute left-[20%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
+                    <div className="absolute left-[40%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
+                    <div className="absolute left-[60%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
+                    <div className="absolute left-[80%] top-0 bottom-0 w-[1px] bg-black/20 z-10"></div>
+                    
+                    <div 
+                      ref={chargeBarRef}
+                      className="h-full bg-orange-500"
+                      style={{ width: '0%', transition: 'none' }}
+                    />
+                  </div>
+                </div>
+              )}
 
-        {/* Next Food Queue */}
-        <div className="absolute bottom-4 right-4 flex gap-2 pointer-events-none">
-          {nextFoods.slice(0, 1).map((f, i) => (
-            <div key={i} className={`w-8 h-8 rounded-full border border-black flex items-center justify-center text-sm ${FOODS[f].color} opacity-80`}>
-              {FOODS[f].emoji}
+              <div 
+                className={`relative flex items-center justify-center cursor-grab active:cursor-grabbing w-32 h-32 mb-10 ${isCharging ? 'scale-110' : ''}`}
+              >
+                {/* Hand Container - Rotates to follow drag (Wrist Bend) */}
+                <motion.div
+                  className="absolute w-full h-full flex items-center justify-center origin-bottom"
+                  style={{
+                    x: isCharging ? dragOffset.x : 0,
+                    y: isCharging ? dragOffset.y : 0,
+                    rotate: isCharging ? -dragOffset.x * 0.5 : 0,
+                    transition: isCharging ? 'none' : 'all 0.3s ease-out'
+                  }}
+                >
+                  {/* Hand SVG */}
+                  <svg width="110" height="110" viewBox="0 0 100 100" className="drop-shadow-xl">
+                    {/* Simple Hand Shape (Palm + Fingers) */}
+                    <path 
+                      d="M30,100 L30,60 Q30,30 50,30 Q70,30 70,60 L70,100 Z" 
+                      fill="#FFCCAA" 
+                      stroke="black" 
+                      strokeWidth="3"
+                    />
+                    {/* Thumb */}
+                    <path 
+                      d="M70,70 Q90,70 90,50 Q90,30 70,40" 
+                      fill="#FFCCAA" 
+                      stroke="black" 
+                      strokeWidth="3"
+                      fillOpacity="0" // Thumb is behind or outline? Let's make it simple
+                    />
+                    {/* Fingers Detail */}
+                    <path d="M40,30 L40,60" stroke="black" strokeWidth="2" opacity="0.3" />
+                    <path d="M50,30 L50,60" stroke="black" strokeWidth="2" opacity="0.3" />
+                    <path d="M60,30 L60,60" stroke="black" strokeWidth="2" opacity="0.3" />
+                  </svg>
+
+                  {/* Food in Hand */}
+                  <div className="absolute top-[40%] text-5xl z-10 pointer-events-none">
+                    {FOODS[currentFood].emoji}
+                  </div>
+
+                  {/* Direction Indicator Triangle (Inside Hand Container) */}
+                  {isCharging && (Math.abs(dragOffset.x) > 5 || Math.abs(dragOffset.y) > 5) && (
+                    <div className="absolute top-0 left-1/2 -translate-x-1/2 -translate-y-full z-20">
+                      {/* Triangle pointing UP (relative to Hand) */}
+                      <div className="w-0 h-0 border-l-[10px] border-l-transparent border-r-[10px] border-r-transparent border-b-[20px] border-b-black" />
+                    </div>
+                  )}
+                </motion.div>
+              </div>
             </div>
-          ))}
+            <span className="text-sm font-bold text-white drop-shadow-md">快喂我</span>
+          </div>
+
+          {/* Right Group - Pinned to Right Edge */}
+          <div className="absolute right-5 bottom-0 flex flex-col items-center gap-2">
+            <div className="relative h-32 w-24">
+              {/* Magnet (Top) */}
+              <div className="absolute top-0 left-0 right-0 flex flex-col items-center">
+                <button 
+                  className={`w-24 h-12 rounded-full shadow-lg border-2 border-black active:scale-95 transition-transform flex items-center justify-center gap-1 ${
+                    powerUpsUsed.magnet ? 'bg-gray-400 opacity-50 cursor-not-allowed' : 'bg-white text-black'
+                  }`}
+                  onClick={activateMagnet}
+                  disabled={powerUpsUsed.magnet}
+                  title="Magnet"
+                >
+                  <span className="text-xl">🧲</span>
+                </button>
+              </div>
+              {/* Magnet Label */}
+              <div className="absolute top-14 left-0 right-0 flex justify-center">
+                <span className="text-[10px] font-bold text-white drop-shadow-md">勾引</span>
+              </div>
+
+              {/* Discard Button (Bottom) - Now a Pill Button */}
+              <div className="absolute bottom-0 left-0 right-0 flex flex-col items-center">
+                <button 
+                  onClick={handleDiscard}
+                  className="w-24 h-12 rounded-full bg-white border-2 border-black flex items-center justify-center text-2xl shadow-lg active:scale-95 transition-transform hover:bg-gray-100"
+                  title="Discard"
+                >
+                  🗑️
+                </button>
+              </div>
+            </div>
+            {/* Discard Label - Outside */}
+            <span className="text-[10px] font-bold text-white drop-shadow-md mt-1">换菜</span>
+          </div>
+
+          {/* Discard Animation - Only Emoji Falls */}
+          <AnimatePresence>
+            {discardedFood && (
+              <motion.div
+                key={discardedFood.id}
+                initial={{ opacity: 1, y: 0, scale: 1, rotate: 0 }}
+                animate={{ opacity: 0, y: 150, scale: 0.5, rotate: 180 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.5, ease: "easeIn" }}
+                className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 text-6xl pointer-events-none z-20"
+              >
+                {FOODS[discardedFood.type].emoji}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
         </div>
       </div>
     </div>

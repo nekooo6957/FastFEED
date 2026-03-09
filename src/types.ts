@@ -22,6 +22,8 @@ export interface AnimalEntity {
   y: number; // 0-100% (Bottom to Top, representing depth)
   state: 'hungry' | 'eating' | 'full' | 'dead' | 'wrong_food';
   hungerTimer: number;
+  requiredFeeds: number;
+  currentFeeds: number;
 }
 
 export interface GameState {
@@ -96,7 +98,9 @@ export const ANIMALS: Record<AnimalType, AnimalConfig> = {
 };
 
 export const LEVEL_CONFIG = [
-  { level: 1, animalCount: 3, time: 30, types: ['dog', 'rabbit', 'sheep'] as AnimalType[] },
-  { level: 2, animalCount: 6, time: 45, types: ['dog', 'rabbit', 'sheep', 'cat', 'chicken', 'frog'] as AnimalType[] },
-  { level: 3, animalCount: 9, time: 30, types: ['dog', 'rabbit', 'sheep', 'cat', 'chicken', 'frog'] as AnimalType[] },
+  { level: 1, animalCount: 1, time: 30, types: ['dog', 'rabbit', 'sheep'] as AnimalType[] },
+  { level: 2, animalCount: 4, time: 45, types: ['dog', 'rabbit', 'sheep', 'cat', 'chicken', 'frog'] as AnimalType[] },
+  { level: 3, animalCount: 9, time: 60, types: ['dog', 'rabbit', 'sheep', 'cat', 'chicken', 'frog'] as AnimalType[] },
+  { level: 4, animalCount: 16, time: 90, types: ['dog', 'rabbit', 'sheep', 'cat', 'chicken', 'frog'] as AnimalType[] },
+  { level: 5, animalCount: 25, time: 120, types: ['dog', 'rabbit', 'sheep', 'cat', 'chicken', 'frog'] as AnimalType[] },
 ];
